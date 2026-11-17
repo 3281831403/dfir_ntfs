@@ -13,7 +13,8 @@ import io
 import gzip
 import tarfile
 import pickle
-from dfir_ntfs import MFT, WSL, USN, Attributes, LogFile, BootSector, ShadowCopy, PartitionTable, MoveTable
+import struct
+from dfir_ntfs import MFT, WSL, USN, Attributes, LogFile, BootSector, ShadowCopy, PartitionTable, MoveTable, AttributeChain
 from dfir_ntfs.addons import FAT, exFAT
 
 TEST_DATA_DIR = 'test_data'
@@ -1457,6 +1458,332 @@ def test_logfile_empty():
 		lf = LogFile.LogFileParser(f)
 
 	f.close()
+
+def _collect_in_place_locations(log_path, mft_path):
+	mft = MFT.MasterFileTableParser(open(mft_path, 'rb'))
+	lf = LogFile.LogFileParser(open(log_path, 'rb'))
+	analyzer = AttributeChain.InPlaceUpdateAnalyzer(mft)
+
+	return list(analyzer.analyze(lf))
+
+def test_logfile_in_place_classification_counts():
+	locations = _collect_in_place_locations(LOGFILE_10_4K, MFT_4K)
+
+	# Every NTFS log record of this file yields exactly one location.
+	assert len(locations) == 399
+
+	counts = dict()
+	for location in locations:
+		counts[location.classification] = counts.get(location.classification, 0) + 1
+
+	# 254 records are in-place (resident) updates, the remaining 145 are not.
+	assert sum(counts.get(category, 0) for category in [
+		AttributeChain.CLASSIFICATION_INSIDE_ATTRIBUTE,
+		AttributeChain.CLASSIFICATION_CROSSES_ATTRIBUTE_BOUNDARY,
+		AttributeChain.CLASSIFICATION_OUTSIDE_ATTRIBUTES,
+		AttributeChain.CLASSIFICATION_TARGET_RECORD_MISSING
+	]) == 254
+
+	assert counts[AttributeChain.CLASSIFICATION_NOT_IN_PLACE] == 145
+	assert counts[AttributeChain.CLASSIFICATION_INSIDE_ATTRIBUTE] == 183
+	assert counts[AttributeChain.CLASSIFICATION_OUTSIDE_ATTRIBUTES] == 56
+	assert counts[AttributeChain.CLASSIFICATION_CROSSES_ATTRIBUTE_BOUNDARY] == 15
+	assert counts.get(AttributeChain.CLASSIFICATION_TARGET_RECORD_MISSING, 0) == 0
+
+	# The five categories are mutually exclusive and exhaustive.
+	assert sum(counts.values()) == 399
+
+def test_logfile_in_place_offsets_and_values():
+	locations = _collect_in_place_locations(LOGFILE_10_4K, MFT_4K)
+
+	inside_locations = [ location for location in locations if location.is_inside() ]
+
+	for location in inside_locations:
+		descriptor = location.descriptor
+
+		# The located byte range must be fully covered by the attribute record.
+		assert descriptor.record_offset <= location.offset_in_target
+		assert location.offset_in_target + location.write_length <= descriptor.record_offset + descriptor.record_length
+		assert location.offset_in_attribute == location.offset_in_target - descriptor.record_offset
+		assert location.offset_in_region >= 0
+
+		# The redo and undo buffers must match the advertised lengths.
+		assert len(location.redo_data) == location.redo_length
+		assert len(location.undo_data) == location.undo_length
+		assert location.write_length == max(location.redo_length, location.undo_length)
+
+	# The hard-coded $STANDARD_INFORMATION heuristic used to recognize only 17 records;
+	# attribute-chain based location must recognize all 36 $STANDARD_INFORMATION value updates.
+	si_locations = [ location for location in inside_locations
+		if location.descriptor.type_code == Attributes.ATTR_TYPE_STANDARD_INFORMATION
+		and location.region == AttributeChain.ATTRIBUTE_REGION_RESIDENT_VALUE ]
+	assert len(si_locations) == 36
+
+	# Every record recognized by the old hard-coded heuristic must be among the 36.
+	old_heuristic_count = 0
+	for location in inside_locations:
+		if location.redo_operation != LogFile.UpdateResidentValue:
+			continue
+
+		si_attr_offset = (72 if location.frs_size == 4096 else 56) + 24
+		if si_attr_offset <= location.offset_in_target <= si_attr_offset + 32:
+			old_heuristic_count += 1
+			assert location.descriptor.type_code == Attributes.ATTR_TYPE_STANDARD_INFORMATION
+
+	assert old_heuristic_count == 17
+
+	# $INDEX_ROOT, $DATA and $BITMAP updates, previously unexplained, must now be located.
+	type_codes_hit = set(location.descriptor.type_code for location in inside_locations)
+	assert Attributes.ATTR_TYPE_INDEX_ROOT in type_codes_hit
+	assert Attributes.ATTR_TYPE_DATA in type_codes_hit
+	assert Attributes.ATTR_TYPE_BITMAP in type_codes_hit
+
+	# Named attributes must carry their names.
+	named_i30 = [ location for location in inside_locations
+		if location.descriptor.type_code == Attributes.ATTR_TYPE_INDEX_ROOT and location.descriptor.name == '$I30' ]
+	assert len(named_i30) > 0
+
+def test_logfile_in_place_outside_and_cross():
+	locations = _collect_in_place_locations(LOGFILE_10_4K, MFT_4K)
+
+	outside = [ location for location in locations if location.classification == AttributeChain.CLASSIFICATION_OUTSIDE_ATTRIBUTES ]
+	crosses = [ location for location in locations if location.classification == AttributeChain.CLASSIFICATION_CROSSES_ATTRIBUTE_BOUNDARY ]
+
+	assert len(outside) == 56
+	assert len(crosses) == 15
+
+	# Outside records must not be assigned to any attribute, but still expose the raw values.
+	for location in outside:
+		assert location.descriptor is None
+		assert location.region is None
+		assert location.classification_reason is not None
+		assert location.redo_length > 0 or location.undo_length > 0
+
+	# Cross-boundary records keep the starting attribute, but are never reported as fully inside.
+	for location in crosses:
+		assert location.descriptor is not None
+		assert location.offset_in_target + location.write_length > location.descriptor.record_offset + location.descriptor.record_length
+		assert location.classification_reason is not None
+
+	# Record initialization writes start at offset zero and cover the FRS header region, not an attribute.
+	init_outside = [ location for location in outside if location.redo_operation == LogFile.InitializeFileRecordSegment ]
+	assert len(init_outside) == 25
+	assert all(location.offset_in_target == 0 for location in init_outside)
+
+def test_logfile_in_place_not_in_place():
+	locations = _collect_in_place_locations(LOGFILE_10_4K, MFT_4K)
+
+	not_in_place = [ location for location in locations if location.classification == AttributeChain.CLASSIFICATION_NOT_IN_PLACE ]
+	assert len(not_in_place) == 145
+
+	for location in not_in_place:
+		assert location.target_frs_number is None
+		assert location.descriptor is None
+		assert location.classification_reason is not None
+
+def test_logfile_in_place_deterministic():
+	first = _collect_in_place_locations(LOGFILE_10_4K, MFT_4K)
+	second = _collect_in_place_locations(LOGFILE_10_4K, MFT_4K)
+
+	assert len(first) == len(second)
+
+	for a, b in zip(first, second):
+		assert a.lsn == b.lsn
+		assert a.classification == b.classification
+		assert a.offset_in_target == b.offset_in_target
+		assert a.redo_data == b.redo_data
+		assert a.undo_data == b.undo_data
+
+		if a.descriptor is None:
+			assert b.descriptor is None
+		else:
+			assert a.descriptor.type_code == b.descriptor.type_code
+			assert a.descriptor.name == b.descriptor.name
+			assert a.descriptor.record_offset == b.descriptor.record_offset
+			assert a.region == b.region
+			assert a.offset_in_attribute == b.offset_in_attribute
+			assert a.offset_in_region == b.offset_in_region
+
+def test_attribute_chain_missing_target_record():
+	mft = MFT.MasterFileTableParser(open(MFT_4K, 'rb'))
+	analyzer = AttributeChain.InPlaceUpdateAnalyzer(mft)
+
+	class FakeLogRecord(object):
+		lsn = 1
+		transaction_id = 1
+		cluster_size = 4096
+		# A minimal 32-byte NTFS log record header placeholder (the analyzer uses the
+		# accessor methods below, not the raw buffer).
+		buf = b'\x00' * 32
+
+		def get_redo_operation(self):
+			return LogFile.UpdateResidentValue
+
+		def get_undo_operation(self):
+			return LogFile.UpdateResidentValue
+
+		def get_redo_data(self):
+			return b'\x00' * 8
+
+		def get_undo_data(self):
+			return b'\x01' * 8
+
+		def get_target_block_size(self):
+			return 8
+
+		def calculate_mft_target_number(self):
+			# Far past the end of the test $MFT.
+			return 1000000
+
+		def calculate_offset_in_target(self):
+			return 72 + 24
+
+	location = analyzer.locate(FakeLogRecord())
+	assert location.classification == AttributeChain.CLASSIFICATION_TARGET_RECORD_MISSING
+	assert location.descriptor is None
+	assert location.classification_reason is not None
+
+def test_attribute_chain_bad_record_isolation():
+	# A corrupted target record must yield a 'missing' classification and never raise.
+	mft = MFT.MasterFileTableParser(open(MFT_4K, 'rb'))
+	analyzer = AttributeChain.InPlaceUpdateAnalyzer(mft)
+
+	good_chain = analyzer.get_attribute_chain(0)
+	assert good_chain is not None
+	assert len(good_chain.descriptors) > 0
+
+	class CorruptMFT(object):
+		file_record_segment_size = mft.file_record_segment_size
+
+		def get_file_record_segment_by_number(self, number):
+			raise MFT.MasterFileTableException('synthetic failure')
+
+	corrupt_analyzer = AttributeChain.InPlaceUpdateAnalyzer(CorruptMFT())
+	assert corrupt_analyzer.get_attribute_chain(0) is None
+	assert 0 in corrupt_analyzer.frs_error_cache
+
+	class FakeLogRecord(object):
+		lsn = 2
+		transaction_id = 2
+		cluster_size = 4096
+		buf = b''
+
+		def get_redo_operation(self):
+			return LogFile.UpdateResidentValue
+
+		def get_undo_operation(self):
+			return LogFile.UpdateResidentValue
+
+		def get_redo_data(self):
+			return b''
+
+		def get_undo_data(self):
+			return b''
+
+		def get_target_block_size(self):
+			return 8
+
+		def calculate_mft_target_number(self):
+			return 0
+
+		def calculate_offset_in_target(self):
+			return 72
+
+	location = corrupt_analyzer.locate(FakeLogRecord())
+	assert location.classification == AttributeChain.CLASSIFICATION_TARGET_RECORD_MISSING
+
+def test_attribute_chain_descriptor_regions():
+	mft = MFT.MasterFileTableParser(open(MFT_4K, 'rb'))
+	analyzer = AttributeChain.InPlaceUpdateAnalyzer(mft)
+
+	chain = analyzer.get_attribute_chain(0)
+	assert chain is not None
+
+	# Offset zero and the FRS header area are outside the attribute chain.
+	assert chain.find_attribute_at_offset(0) is None
+
+	# The first attribute starts at the advertised first-attribute offset.
+	first_descriptor = chain.descriptors[0]
+	assert first_descriptor.record_offset == chain.first_attribute_offset
+
+	descriptor, region, offset_in_attribute, offset_in_region = chain.describe_offset(chain.first_attribute_offset)
+	assert descriptor is first_descriptor
+	assert region in [ AttributeChain.ATTRIBUTE_REGION_RECORD_HEADER, AttributeChain.ATTRIBUTE_REGION_NONRESIDENT_HEADER ]
+	assert offset_in_attribute == 0
+	assert offset_in_region == 0
+
+	# An offset past every attribute is uncovered.
+	assert chain.find_attribute_at_offset(chain.frs_size - 1) is None
+
+def test_standard_information_timestamp_decoder():
+	import datetime
+
+	mft = MFT.MasterFileTableParser(open(MFT_4K, 'rb'))
+	lf = LogFile.LogFileParser(open(LOGFILE_10_4K, 'rb'))
+	analyzer = AttributeChain.InPlaceUpdateAnalyzer(mft)
+
+	# A fully covered SI value update decodes all four timestamps and never raises.
+	full_count = 0
+	for location in analyzer.analyze(lf):
+		decoded = AttributeChain.decode_standard_information_timestamps(location)
+		if full_count == 0 and len(decoded) == 4:
+			full_count += 1
+			assert len(decoded) == 4
+			for field_name, redo_datetime, undo_datetime in decoded:
+				assert redo_datetime is None or type(redo_datetime) is datetime.datetime
+				assert undo_datetime is None or type(undo_datetime) is datetime.datetime
+
+		# Partial updates must never decode a field the buffer does not fully cover.
+		if location.is_inside() and location.descriptor.type_code == Attributes.ATTR_TYPE_STANDARD_INFORMATION:
+			for field_name, redo_datetime, undo_datetime in decoded:
+				field_offset = dict((name, off) for off, name in AttributeChain.STANDARD_INFORMATION_TIMESTAMP_FIELDS)[field_name]
+				start = field_offset - location.offset_in_region
+				if redo_datetime is not None:
+					assert start >= 0 and start + 8 <= location.redo_length
+				if undo_datetime is not None:
+					assert start >= 0 and start + 8 <= location.undo_length
+
+	assert full_count == 1
+
+	# A non-SI location yields nothing.
+	class OtherLocation(object):
+		classification = AttributeChain.CLASSIFICATION_INSIDE_ATTRIBUTE
+
+		class DummyDescriptor(object):
+			type_code = Attributes.ATTR_TYPE_DATA
+
+		descriptor = DummyDescriptor()
+		region = AttributeChain.ATTRIBUTE_REGION_RESIDENT_VALUE
+		offset_in_region = 0
+		redo_data = b'\x00' * 32
+		undo_data = b'\x00' * 32
+
+		def is_inside(self):
+			return True
+
+	assert AttributeChain.decode_standard_information_timestamps(OtherLocation()) == []
+
+def test_attribute_chain_corrupt_frs_does_not_stop_analysis():
+	# Corrupt the signature of a frequently targeted FRS (#9): all its records must be
+	# classified as missing while every other record is still located.
+	original = open(MFT_4K, 'rb').read()
+	corrupt = bytearray(original)
+	corrupt[9 * 4096 : 9 * 4096 + 4] = b'XXXX'
+
+	mft = MFT.MasterFileTableParser(io.BytesIO(bytes(corrupt)))
+	lf = LogFile.LogFileParser(open(LOGFILE_10_4K, 'rb'))
+	analyzer = AttributeChain.InPlaceUpdateAnalyzer(mft)
+
+	locations = list(analyzer.analyze(lf))
+	assert len(locations) == 399
+
+	frs9 = [ location for location in locations if location.target_frs_number == 9 ]
+	assert len(frs9) == 60
+	assert all(location.classification == AttributeChain.CLASSIFICATION_TARGET_RECORD_MISSING for location in frs9)
+
+	others = [ location for location in locations if location.target_frs_number != 9 ]
+	assert all(location.classification != AttributeChain.CLASSIFICATION_TARGET_RECORD_MISSING for location in others)
+	assert any(location.is_inside() for location in others)
 
 def test_mft_mirr():
 	f = open(MFT_MIRR, 'rb')
