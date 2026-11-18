@@ -5,6 +5,7 @@
 
 import pytest
 import os
+import struct
 import hashlib
 import datetime
 import uuid
@@ -904,6 +905,229 @@ def test_usn_journal():
 	test_even_more_larger_file(4096, 4096)
 	test_even_more_larger_file(4096, 8192)
 	test_even_more_larger_file(4096, 8200)
+
+def test_usn_journal_verification():
+	with open(MFT_UNICODE, 'rb') as f:
+		mft = MFT.MasterFileTableParser(f)
+		with open(USNJOURNAL_1, 'rb') as j:
+			journal = USN.ChangeJournalParser(j)
+
+			verdicts = []
+			results = {}
+			v4_count = 0
+			v23_count = 0
+
+			for usn_record in journal.usn_records():
+				verdict, file_path, slot_names, v4_extents = USN.verify_record(usn_record, mft)
+				assert verdict in [USN.VERDICT_CORROBORATED, USN.VERDICT_NAME_CONFLICT, USN.VERDICT_TARGET_MISSING, USN.VERDICT_NO_NAME]
+
+				# Only corroborated records carry a rebuilt path.
+				if verdict == USN.VERDICT_CORROBORATED:
+					assert len(file_path) > 0
+				else:
+					assert file_path == ''
+
+				# Only name-conflict records carry the current slot names.
+				if verdict == USN.VERDICT_NAME_CONFLICT:
+					assert len(slot_names) > 0
+				else:
+					assert slot_names == ''
+
+				if type(usn_record) is USN.USN_RECORD_V4:
+					v4_count += 1
+					assert verdict == USN.VERDICT_NO_NAME
+					# Every V4 record in this journal has one 16-byte extent, rendered as 'offset:length'.
+					assert v4_extents.count(':') == 1
+					extent_offset, extent_length = v4_extents.split(':')
+					assert int(extent_offset) == 0
+					assert int(extent_length) == 2228224
+					assert list(usn_record.extents()) == [(0, 2228224)]
+				else:
+					v23_count += 1
+					assert v4_extents == ''
+
+				verdicts.append(verdict)
+				results[usn_record.get_usn()] = (verdict, file_path, slot_names, usn_record.get_file_name() if type(usn_record) is USN.USN_RECORD_V2_OR_V3 else '')
+
+	assert len(verdicts) == 271
+	assert v23_count == 264
+	assert v4_count == 7
+	assert verdicts.count(USN.VERDICT_CORROBORATED) == 10
+	assert verdicts.count(USN.VERDICT_NAME_CONFLICT) == 24
+	assert verdicts.count(USN.VERDICT_TARGET_MISSING) == 230
+	assert verdicts.count(USN.VERDICT_NO_NAME) == 7
+
+	# The first record (USN 0) claims "New folder" but its slot 40 currently holds the SID directory name.
+	assert results[0][0] == USN.VERDICT_NAME_CONFLICT
+	assert results[0][3] == 'New folder'
+	assert results[0][2] == 'S-1-5-21-2341207468-2645333676-3461800803-1001'
+
+	# Corroborated records: rebuilt paths come from the record's own name and the parent reference.
+	assert results[2136][0] == USN.VERDICT_CORROBORATED and results[2136][1] == '/.'
+	assert results[8704][0] == USN.VERDICT_CORROBORATED
+	assert results[8704][1] == '/$Extend/$RmMetadata/$TxfLog/$TxfLog.blf'
+
+	# V4 records never carry a name and are always 'no-name-in-record'.
+	for usn_number in [8192, 8464, 15648, 21680, 27696, 29056, 29616]:
+		assert results[usn_number][0] == USN.VERDICT_NO_NAME
+		assert results[usn_number][3] == ''
+
+def test_usn_verification_target_missing():
+	# A journal record referencing a slot beyond the $MFT must be reported as target-missing, not raise.
+	with open(MFT_UNICODE, 'rb') as f:
+		mft = MFT.MasterFileTableParser(f)
+
+		with open(USN_1, 'rb') as f_usn:
+			usn_record = USN.GetUsnRecord(f_usn.read())
+
+		# Rewrite the file reference number to a non-existent slot (keep the 48-bit segment number).
+		raw = bytearray(usn_record.record_raw)
+		struct.pack_into('<Q', raw, 8, 0xFFFFFFFFFFFF)
+		rewritten = USN.GetUsnRecord(bytes(raw))
+
+		verdict, file_path, slot_names, v4_extents = USN.verify_record(rewritten, mft)
+		assert verdict == USN.VERDICT_TARGET_MISSING
+		assert file_path == '' and slot_names == '' and v4_extents == ''
+
+def test_usn_verification_name_conflict_and_case():
+	with open(MFT_UNICODE, 'rb') as f:
+		mft = MFT.MasterFileTableParser(f)
+		with open(USNJOURNAL_1, 'rb') as j:
+			journal = USN.ChangeJournalParser(j)
+
+			conflict_records = []
+			for usn_record in journal.usn_records():
+				if type(usn_record) is not USN.USN_RECORD_V2_OR_V3:
+					continue
+
+				verdict, file_path, slot_names, v4_extents = USN.verify_record(usn_record, mft)
+				if verdict == USN.VERDICT_NAME_CONFLICT:
+					conflict_records.append((usn_record, slot_names))
+
+			assert len(conflict_records) == 24
+
+			# The reported slot names must be the actual current names of the target $MFT slot.
+			for usn_record, slot_names in conflict_records:
+				fr_number = MFT.DecodeFileRecordSegmentReference(usn_record.get_file_reference_number())[0]
+				file_record = mft.get_file_record_by_number(fr_number)
+				expect_names = []
+				for attribute in file_record.attributes():
+					if type(attribute) is MFT.AttributeRecordNonresident:
+						continue
+					attribute_value = attribute.value_decoded()
+					if type(attribute_value) is Attributes.FileName and attribute_value.get_file_name() not in expect_names:
+						expect_names.append(attribute_value.get_file_name())
+
+				assert slot_names == ' | '.join(expect_names)
+
+			# Case-insensitive matching: an upper-cased copy of a corroborated record stays corroborated.
+			with open(USNJOURNAL_1, 'rb') as j2:
+				for usn_record in USN.ChangeJournalParser(j2).usn_records():
+					if type(usn_record) is not USN.USN_RECORD_V2_OR_V3 or usn_record.get_usn() != 8704:
+						continue
+
+					raw = bytearray(usn_record.record_raw)
+					name_offset = usn_record.get_file_name_offset()
+					name_length = usn_record.get_file_name_length()
+					raw[name_offset : name_offset + name_length] = usn_record.get_file_name().upper().encode('utf-16le')
+					upper_record = USN.GetUsnRecord(bytes(raw))
+
+					verdict, file_path, slot_names, v4_extents = USN.verify_record(upper_record, mft)
+					assert verdict == USN.VERDICT_CORROBORATED
+					assert file_path == '/$Extend/$RmMetadata/$TxfLog/$TxfLog.blf'
+					break
+				else:
+					raise AssertionError('the USN 8704 record was not found')
+
+def _make_synthetic_file_name(name, parent_reference, name_space):
+	"""Build a raw $FILE_NAME attribute value (with a minimal header) for a synthetic record."""
+
+	name_raw = name.encode('utf-16le')
+	buf = bytearray(66 + len(name_raw))
+	struct.pack_into('<Q', buf, 0, parent_reference)
+	buf[64] = len(name) # The $FILE_NAME name length is in characters.
+	buf[65] = name_space
+	buf[66 : ] = name_raw
+	return bytes(buf)
+
+def _make_synthetic_v2_record(file_reference, parent_reference, file_name):
+	"""Build a minimal version 2 USN record buffer carrying a given name."""
+
+	name_raw = file_name.encode('utf-16le')
+	record_length = (60 + len(name_raw) + 7) & ~7
+	buf = bytearray(record_length)
+	struct.pack_into('<L', buf, 0, record_length)
+	struct.pack_into('<H', buf, 4, 2) # Major version 2.
+	struct.pack_into('<H', buf, 6, 0)
+	struct.pack_into('<Q', buf, 8, file_reference)
+	struct.pack_into('<Q', buf, 16, parent_reference)
+	struct.pack_into('<Q', buf, 24, 1234) # USN value.
+	struct.pack_into('<H', buf, 56, len(name_raw)) # The USN record name length is in bytes.
+	struct.pack_into('<H', buf, 58, 60)
+	buf[60 : 60 + len(name_raw)] = name_raw
+	return USN.GetUsnRecord(bytes(buf))
+
+class _SyntheticFileRecord(object):
+	def __init__(self, file_name_specs, record_flags = 2):
+		self.attributes_list = [
+			MFT.AttributeRecordResident(0x30, None, _make_synthetic_file_name(name, parent, name_space))
+			for name, parent, name_space in file_name_specs
+		]
+		self.record_flags = record_flags
+
+	def attributes(self):
+		return list(self.attributes_list)
+
+	def get_flags(self):
+		return self.record_flags
+
+class _SyntheticMFT(object):
+	AttributeRecordNonresident = MFT.AttributeRecordNonresident
+	MasterFileTableException = MFT.MasterFileTableException
+
+	def __init__(self, slots):
+		self.slots = slots
+
+	def get_file_record_by_number(self, number, expected_sequence_number = None, allow_child_file_record_segment_number = True):
+		if number not in self.slots:
+			raise MFT.MasterFileTableException('missing slot: {}'.format(number))
+		return self.slots[number]
+
+def test_usn_verification_dos_alias_and_path_rebuild():
+	parent_reference = MFT.EncodeFileRecordSegmentReference(7, 1)
+	root_reference = MFT.EncodeFileRecordSegmentReference(MFT.FILE_NUMBER_ROOT, 5)
+
+	# A record carries an upper-cased DOS (8.3) alias name.
+	usn_record = _make_synthetic_v2_record(42, parent_reference, 'LONGFI~1.TXT')
+	assert usn_record.get_file_name() == 'LONGFI~1.TXT'
+
+	parent_record = _SyntheticFileRecord([('parentdir', root_reference, 0)], MFT.FILE_FILE_NAME_INDEX_PRESENT)
+	root_record = _SyntheticFileRecord([('.', root_reference, 3)], MFT.FILE_FILE_NAME_INDEX_PRESENT)
+
+	# The target slot holds the same alias in the DOS name space (flags 2) plus a Win32 name (flags 1).
+	target_record = _SyntheticFileRecord([
+		('LongFi~1.TXT', parent_reference, Attributes.FILE_NAME_DOS),
+		('longfilename.txt', parent_reference, Attributes.FILE_NAME_NTFS)
+	])
+	mft = _SyntheticMFT({ 42: target_record, 7: parent_record, MFT.FILE_NUMBER_ROOT: root_record })
+
+	verdict, file_path, slot_names, v4_extents = USN.verify_record(usn_record, mft)
+	assert verdict == USN.VERDICT_CORROBORATED
+	# The rebuilt path is anchored on the DOS attribute the record matched, case-insensitively.
+	assert file_path == '/parentdir/LongFi~1.TXT'
+	assert slot_names == '' and v4_extents == ''
+
+	# Unrelated names in the same slot turn the record into a name-conflict and expose the current slot names.
+	conflict_record = _SyntheticFileRecord([('totally_different.bin', parent_reference, 0)])
+	mft_conflict = _SyntheticMFT({ 42: conflict_record, 7: parent_record })
+	verdict, file_path, slot_names, v4_extents = USN.verify_record(usn_record, mft_conflict)
+	assert verdict == USN.VERDICT_NAME_CONFLICT
+	assert file_path == '' and slot_names == 'totally_different.bin' and v4_extents == ''
+
+	# A slot that cannot be read is reported as target-missing without raising.
+	verdict, file_path, slot_names, v4_extents = USN.verify_record(usn_record, _SyntheticMFT({}))
+	assert verdict == USN.VERDICT_TARGET_MISSING
+	assert file_path == '' and slot_names == '' and v4_extents == ''
 
 def test_compressed_sparse():
 	f = open(MFT_COMPRESSED_SPARSE, 'rb')

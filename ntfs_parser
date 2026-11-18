@@ -297,7 +297,7 @@ def process_usn():
 	usn_journal = USN.ChangeJournalParser(input_file)
 	mft_file = MFT.MasterFileTableParser(input_mft)
 
-	csv_writer.writerow(['USN value', 'Source', 'Reason', 'MFT reference number', 'Parent MFT reference number', 'Timestamp', 'File name', 'File path (from $MFT)'])
+	csv_writer.writerow(['USN value', 'Source', 'Reason', 'MFT reference number', 'Parent MFT reference number', 'Timestamp', 'File name', 'File path (from $MFT)', 'Verification verdict', 'Current name(s) in the target slot', 'V4 extents (offset:length)'])
 
 	for usn_record in usn_journal.usn_records():
 		r_usn = usn_record.get_usn()
@@ -306,27 +306,25 @@ def process_usn():
 		fr_reference_number = usn_record.get_file_reference_number()
 		parent_fr_reference_number = usn_record.get_parent_file_reference_number()
 
-		if type(usn_record) is USN.USN_RECORD_V2_OR_V3:
+		is_v4_record = type(usn_record) is USN.USN_RECORD_V4
+
+		if not is_v4_record:
 			r_timestamp = format_timestamp(usn_record.get_timestamp())
 			fr_file_name = usn_record.get_file_name()
 		else:
 			r_timestamp = ''
 			fr_file_name = ''
 
-		fr_number, fr_sequence = MFT.DecodeFileRecordSegmentReference(fr_reference_number)
-
 		try:
-			file_record = mft_file.get_file_record_by_number(fr_number, fr_sequence)
-			file_paths = mft_file.build_full_paths(file_record)
-		except MFT.MasterFileTableException:
+			verdict, fr_file_path, current_slot_names, v4_extents = USN.verify_record(usn_record, mft_file)
+		except Exception:
+			# A failed enrichment must never break this row or the records following it.
+			verdict = USN.VERDICT_NO_NAME if is_v4_record else USN.VERDICT_TARGET_MISSING
 			fr_file_path = ''
-		else:
-			if len(file_paths) > 0:
-				fr_file_path = file_paths[0]
-			else:
-				fr_file_path = ''
+			current_slot_names = ''
+			v4_extents = ''
 
-		csv_writer.writerow([r_usn, r_source, r_reason, fr_reference_number, parent_fr_reference_number, r_timestamp, fr_file_name, fr_file_path])
+		csv_writer.writerow([r_usn, r_source, r_reason, fr_reference_number, parent_fr_reference_number, r_timestamp, fr_file_name, fr_file_path, verdict, current_slot_names, v4_extents])
 
 def process_log():
 	global input_file, input_mft, output_file

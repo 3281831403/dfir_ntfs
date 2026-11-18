@@ -1,3 +1,9 @@
+Version: 1.1.21
+
+Verify $UsnJrnl:$J records against the current $MFT in the ntfs_parser --usn output: each record is now classified as corroborated, name-conflict, target-missing, or no-name-in-record; corroborated records get a path rebuilt from the record's own name and parent directory reference (case-insensitive, DOS aliases included), name-conflict rows list the current name(s) in the target slot while target-missing rows stay blank, and version 4 records carry their extent offsets and lengths.
+
+---
+
 Version: 1.1.20
 
 Improve handling of unusual FAT volumes.

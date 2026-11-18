@@ -5,6 +5,8 @@
 
 import struct
 from .Attributes import DecodeFiletime
+from . import MFT
+from . import Attributes
 
 # Codes for reasons:
 USN_REASON_BASIC_INFO_CHANGE = 0x00008000
@@ -412,3 +414,171 @@ class ChangeJournalParser(object):
 
 			yield usn
 			pos += usn.get_record_length()
+
+# Verdicts for a change journal record verified against the current $MFT.
+VERDICT_CORROBORATED = 'corroborated'
+"""A version 2.x/3.x record's name and parent directory reference are both present in the target $MFT slot."""
+
+VERDICT_NAME_CONFLICT = 'name-conflict'
+"""The target $MFT slot exists, but no file name in it matches the record (case-insensitively, DOS aliases included)."""
+
+VERDICT_TARGET_MISSING = 'target-missing'
+"""The target $MFT slot cannot be read (the file record segment is missing or invalid)."""
+
+VERDICT_NO_NAME = 'no-name-in-record'
+"""A version 4.x record: it never carries a file name, so it cannot be corroborated by one."""
+
+def _file_name_attribute_values(mft_parser, file_record):
+	"""Return deduplicated $FILE_NAME attribute values of a file record (in the on-disk order)."""
+
+	file_names = []
+	seen = set()
+
+	for attribute in file_record.attributes():
+		if type(attribute) is MFT.AttributeRecordNonresident:
+			continue
+
+		attribute_value = attribute.value_decoded()
+		if type(attribute_value) is not Attributes.FileName:
+			continue
+
+		key = (attribute_value.get_file_name(), attribute_value.get_parent_directory(), attribute_value.get_flags())
+		if key in seen:
+			continue
+
+		seen.add(key)
+		file_names.append(attribute_value)
+
+	return file_names
+
+def current_slot_names(mft_parser, file_record):
+	"""Return the names currently stored in an $MFT slot (all name spaces, DOS aliases included), joined with ' | '."""
+
+	return ' | '.join(attr_file_name.get_file_name() for attr_file_name in _file_name_attribute_values(mft_parser, file_record))
+
+def build_path_for_file_name(mft_parser, file_record, attr_file_name):
+	"""Rebuild a full path for a file record, starting from a specific $FILE_NAME attribute value.
+
+	The record's own name and each parent directory reference are resolved against the $MFT;
+	cycles, orphan records and non-directory parents are handled like MasterFileTableParser.build_full_paths.
+	"""
+
+	path_components = [ attr_file_name.get_file_name() ]
+	parent_reference = attr_file_name.get_parent_directory()
+	parent_segment_number, parent_sequence_number = MFT.DecodeFileRecordSegmentReference(parent_reference)
+
+	if parent_segment_number == MFT.FILE_NUMBER_ROOT:
+		path_components.append('') # Add a root directory.
+		path_components.reverse()
+		return MFT.PATH_SEPARATOR.join(path_components)
+
+	try:
+		parent_file_record = mft_parser.get_file_record_by_number(parent_segment_number, parent_sequence_number, False)
+	except MFT.MasterFileTableException:
+		path_components.append(MFT.UNKNOWN_PATH_PLACEHOLDER) # An invalid parent file record.
+	else:
+		if parent_file_record.get_flags() & MFT.FILE_FILE_NAME_INDEX_PRESENT == 0:
+			path_components.append(MFT.UNKNOWN_PATH_PLACEHOLDER) # Not a directory.
+		else:
+			track = set()
+			track.add(parent_segment_number)
+
+			current_file_record = parent_file_record
+			while True:
+				parent_file_names = _file_name_attribute_values(mft_parser, current_file_record)
+				if len(parent_file_names) == 0:
+					path_components.append(MFT.UNKNOWN_PATH_PLACEHOLDER)
+					break
+
+				# Win32 and POSIX name spaces are preferred, take the first attribute value otherwise.
+				preferred = parent_file_names[0]
+				for candidate in parent_file_names:
+					if candidate.get_flags() & Attributes.FILE_NAME_NTFS > 0 or candidate.get_flags() == 0:
+						preferred = candidate
+						break
+
+				path_components.append(preferred.get_file_name())
+				next_parent_reference = preferred.get_parent_directory()
+				parent_segment_number, parent_sequence_number = MFT.DecodeFileRecordSegmentReference(next_parent_reference)
+
+				if parent_segment_number in track:
+					path_components.append(MFT.UNKNOWN_PATH_PLACEHOLDER) # An invalid path.
+					break
+
+				track.add(parent_segment_number)
+
+				try:
+					current_file_record = mft_parser.get_file_record_by_number(parent_segment_number, parent_sequence_number, False)
+				except MFT.MasterFileTableException:
+					path_components.append(MFT.UNKNOWN_PATH_PLACEHOLDER) # An invalid parent file record.
+					break
+
+				if parent_segment_number == MFT.FILE_NUMBER_ROOT:
+					path_components.append('') # Add a root directory.
+					break
+
+				if current_file_record.get_flags() & MFT.FILE_FILE_NAME_INDEX_PRESENT == 0:
+					path_components.append(MFT.UNKNOWN_PATH_PLACEHOLDER) # Not a directory.
+					break
+
+	path_components.reverse()
+	return MFT.PATH_SEPARATOR.join(path_components)
+
+def format_v4_extents(usn_record):
+	"""Format extents of a version 4 record as 'offset:length' items joined with ' | ' (unsupported extents are hex-encoded)."""
+
+	extent_items = []
+
+	for extent in usn_record.extents():
+		if type(extent) is tuple:
+			extent_items.append('{}:{}'.format(extent[0], extent[1]))
+		else:
+			extent_items.append('0x' + extent.hex().upper())
+
+	return ' | '.join(extent_items)
+
+def verify_record(usn_record, mft_parser):
+	"""Verify a single USN change journal record against the current $MFT.
+
+	Return a tuple: (verdict, rebuilt_file_path, current_slot_names, v4_extents).
+	The rebuilt file path is non-empty only for 'corroborated' records;
+	the current slot names are non-empty only for 'name-conflict' records;
+	the V4 extents string is non-empty only for 'no-name-in-record' records.
+	"""
+
+	is_v4_record = type(usn_record) is USN_RECORD_V4
+
+	if is_v4_record:
+		return (VERDICT_NO_NAME, '', '', format_v4_extents(usn_record))
+
+	fr_number, fr_sequence = MFT.DecodeFileRecordSegmentReference(usn_record.get_file_reference_number())
+	parent_fr_number = MFT.DecodeFileRecordSegmentReference(usn_record.get_parent_file_reference_number())[0]
+
+	try:
+		file_record = mft_parser.get_file_record_by_number(fr_number, fr_sequence)
+	except MFT.MasterFileTableException:
+		try: # Retry without an expected sequence number (the slot may have been reused).
+			file_record = mft_parser.get_file_record_by_number(fr_number)
+		except MFT.MasterFileTableException:
+			file_record = None
+
+	if file_record is None:
+		return (VERDICT_TARGET_MISSING, '', '', '')
+
+	record_file_name = usn_record.get_file_name()
+	matching_file_name = None
+
+	for attr_file_name in _file_name_attribute_values(mft_parser, file_record):
+		# Compare case-insensitively; both Win32/POSIX and DOS names are considered.
+		same_name = attr_file_name.get_file_name().upper() == record_file_name.upper()
+		same_parent = MFT.DecodeFileRecordSegmentReference(attr_file_name.get_parent_directory())[0] == parent_fr_number
+
+		if same_name and same_parent:
+			matching_file_name = attr_file_name
+			break
+
+	if matching_file_name is None:
+		return (VERDICT_NAME_CONFLICT, '', current_slot_names(mft_parser, file_record), '')
+
+	rebuilt_path = build_path_for_file_name(mft_parser, file_record, matching_file_name)
+	return (VERDICT_CORROBORATED, rebuilt_path, '', '')
